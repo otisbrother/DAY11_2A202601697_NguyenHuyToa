@@ -6,9 +6,15 @@ You may use Google ADK plugins, LangGraph, NeMo, or pure Python.
 """
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from assignment.rate_limiter import RateLimitPlugin
 from assignment.audit_log import AuditLogPlugin
 from assignment.monitoring import MonitoringAlert
+from guardrails.output_guardrails import content_filter
+
+
+ALLOWED_EGRESS_HOSTS = frozenset({"api.vinbank.example"})
 
 
 def is_egress_allowed(destination: str, payload: str) -> bool:
@@ -19,7 +25,30 @@ def is_egress_allowed(destination: str, payload: str) -> bool:
     contain a password, API key, database host, phone number or email address.
     Do not let the LLM's prose decide this policy.
     """
-    raise NotImplementedError("Implement is_egress_allowed")
+    if not isinstance(destination, str) or not isinstance(payload, str):
+        return False
+
+    try:
+        parsed = urlparse(destination)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+
+    # Compare the parsed hostname, never a substring of the original URL.
+    # User-info is unnecessary for these API calls and can make URLs deceptive.
+    if (
+        parsed.scheme.lower() != "https"
+        or hostname not in ALLOWED_EGRESS_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        return False
+
+    # The same deterministic PII/secret policy protects both customer-facing
+    # responses and outbound tool payloads.
+    return content_filter(payload)["safe"]
 
 
 def build_production_plugins(
