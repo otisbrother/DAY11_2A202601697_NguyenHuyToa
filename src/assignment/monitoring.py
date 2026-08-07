@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -35,12 +36,62 @@ class MonitoringAlert:
     judge_fails: int = 0
 
     def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+        """Compute current rates and return active threshold alerts."""
+        block_rate = (
+            self.blocked_requests / self.total_requests
+            if self.total_requests
+            else 0.0
+        )
+        judge_fail_rate = (
+            self.judge_fails / self.judge_checks if self.judge_checks else 0.0
+        )
+
+        active_alerts: list[Alert] = []
+        if block_rate > self.block_rate_threshold:
+            active_alerts.append(Alert(
+                metric="block_rate",
+                value=block_rate,
+                threshold=self.block_rate_threshold,
+                message=(
+                    f"Block rate spike: {block_rate:.1%} exceeds "
+                    f"{self.block_rate_threshold:.1%}."
+                ),
+            ))
+
+        if self.rate_limit_hits > self.rate_limit_hit_threshold:
+            active_alerts.append(Alert(
+                metric="rate_limit_hits",
+                value=float(self.rate_limit_hits),
+                threshold=float(self.rate_limit_hit_threshold),
+                message=(
+                    f"Rate-limit spike: {self.rate_limit_hits} hits exceeds "
+                    f"{self.rate_limit_hit_threshold}."
+                ),
+            ))
+
+        if judge_fail_rate > self.judge_fail_rate_threshold:
+            active_alerts.append(Alert(
+                metric="judge_fail_rate",
+                value=judge_fail_rate,
+                threshold=self.judge_fail_rate_threshold,
+                message=(
+                    f"Judge failure spike: {judge_fail_rate:.1%} exceeds "
+                    f"{self.judge_fail_rate_threshold:.1%}."
+                ),
+            ))
+
+        # Recompute instead of duplicating the same alerts on every poll.
+        self.alerts = active_alerts
+        return list(self.alerts)
 
     def export_json(self, filepath: str = "outputs/metrics.json"):
-        """TODO: write metrics + alerts to JSON."""
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+        """Write the latest metrics and alerts to JSON."""
+        self.check_metrics()
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(self.snapshot(), file, indent=2, ensure_ascii=False)
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (
