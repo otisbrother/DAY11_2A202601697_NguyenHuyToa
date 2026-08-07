@@ -5,12 +5,39 @@ Lab 11 — Part 2A: Input Guardrails
   TODO 3: Input Guardrail Plugin (ADK)
 """
 import re
+import unicodedata
 
 from google.genai import types
 from google.adk.plugins import base_plugin
 from google.adk.agents.invocation_context import InvocationContext
 
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
+
+
+def _normalize_for_security(text: str) -> str:
+    """Return a canonical form suitable for deterministic security checks."""
+    if not isinstance(text, str):
+        return ""
+
+    normalized = unicodedata.normalize("NFKC", text)
+    # Format characters include zero-width spaces/joiners, BOM and bidi marks.
+    # Removing them prevents an attacker from splitting a dangerous phrase.
+    normalized = "".join(
+        char for char in normalized if unicodedata.category(char) != "Cf"
+    )
+    return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
+def _fold_accents(text: str) -> str:
+    """Fold Vietnamese accents so configured unaccented topic terms still match."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    folded = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return folded.replace("đ", "d").replace("Đ", "D")
+
+
+def _contains_term(text: str, term: str) -> bool:
+    """Match a configured term as words, not as part of an unrelated word."""
+    return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) is not None
 
 
 # ============================================================
@@ -41,16 +68,51 @@ def detect_injection(user_input: str) -> bool:
     Returns:
         True if injection detected, False otherwise
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+    normalized = _normalize_for_security(user_input)
+    folded = _fold_accents(normalized)
+
+    # Separate families make the detector cover instruction override, role
+    # hijacking and protected-context extraction instead of relying on one
+    # blacklisted sentence.
+    injection_patterns = [
+        r"\bignore\s+(?:all\s+)?(?:previous|above|prior)\s+(?:instructions?|rules?|directives?)\b",
+        r"\bdisregard\s+(?:all\s+)?(?:previous|above|prior)?\s*(?:instructions?|rules?|directives?)\b",
+        r"\bforget\s+(?:all\s+|your\s+)?(?:previous\s+)?(?:instructions?|rules?|prompt)\b",
+        r"\boverride\s+(?:the\s+|your\s+)?(?:system\s+)?(?:prompt|instructions?|rules?)\b",
+        r"\byou\s+are\s+now\b",
+        r"\bpretend\s+(?:that\s+)?you\s+are\b|\bpretend\s+to\s+be\b",
+        r"\bact\s+as\s+(?:a\s+|an\s+)?(?:unrestricted|jailbroken|evil)\b",
+        r"\bsystem\s+prompt\b",
+        r"\breveal\s+(?:your\s+|the\s+)?(?:instructions?|prompt)\b",
+        r"\b(?:show|print|output|expose)\s+(?:me\s+)?(?:your\s+|the\s+)?(?:system\s+)?(?:prompt|instructions?|hidden\s+rules?)\b",
+        r"\b(?:bypass|disable)\s+(?:the\s+|your\s+)?(?:guardrails?|safety|filters?|policy)\b",
+        r"\bbo\s+qua\s+(?:tat\s+ca\s+|moi\s+)?(?:cac\s+)?(?:huong\s+dan|chi\s+dan|quy\s+tac)(?:\s+truoc\s+do)?\b",
+        r"\bquen\s+(?:tat\s+ca\s+|moi\s+)?(?:cac\s+)?(?:huong\s+dan|chi\s+dan|quy\s+tac)\b",
+        r"\btiet\s+lo\s+(?:system\s+prompt|chi\s+dan\s+he\s+thong|huong\s+dan\s+noi\s+bo)\b",
     ]
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
-            return True
-    return False
+    if any(re.search(pattern, folded) for pattern in injection_patterns):
+        return True
+
+    # A second, high-confidence signal catches spacing inserted between letters
+    # (for example "i g n o r e ...") after punctuation/whitespace is removed.
+    compact = re.sub(r"[^a-z0-9]", "", folded)
+    compact_signatures = (
+        "ignoreallpreviousinstructions",
+        "ignoreallpreviousinstruction",
+        "ignorepreviousinstructions",
+        "ignoreaboveinstructions",
+        "revealtheinternalpassword",
+        "revealyoursystemprompt",
+        "revealyourinstructions",
+        "systemprompt",
+        "youarenow",
+        "youarenowdan",
+        "pretendyouare",
+        "actasunrestricted",
+        "boquamoihuongdan",
+    )
+    return any(signature in compact for signature in compact_signatures)
 
 
 # ============================================================
@@ -72,14 +134,18 @@ def topic_filter(user_input: str) -> bool:
     Returns:
         True if input should be BLOCKED (off-topic or blocked topic)
     """
-    input_lower = user_input.lower()
+    normalized = _normalize_for_security(user_input)
+    input_folded = _fold_accents(normalized)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return True
-    # 2. If input doesn't contain any allowed topic -> return True
-    # 3. Otherwise -> return False (allow)
+    blocked_terms = (_fold_accents(_normalize_for_security(t)) for t in BLOCKED_TOPICS)
+    if any(_contains_term(input_folded, term) for term in blocked_terms):
+        return True
 
-    pass  # Replace with your implementation
+    allowed_terms = (_fold_accents(_normalize_for_security(t)) for t in ALLOWED_TOPICS)
+    if any(_contains_term(input_folded, term) for term in allowed_terms):
+        return False
+
+    return True
 
 
 # ============================================================
@@ -132,14 +198,20 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 3. If both are False: return None (let message through)
+        if detect_injection(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot follow instructions that attempt to override the "
+                "assistant's security rules."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related questions."
+            )
+
+        return None
 
 
 # ============================================================
